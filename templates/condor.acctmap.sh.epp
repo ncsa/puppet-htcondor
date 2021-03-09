@@ -1,0 +1,248 @@
+<%- | String  $ldapsearch_cmd,
+      String  $ldapsearch_dnbase,
+      String  $ldapsearch_field,
+      String  $ldapsearch_host,
+      String  $ldapsearch_opts,
+      String  $ldapsearch_query
+| -%>
+#!/bin/bash
+
+# Create/update condor.acctmap file to control who can
+# submit to HTCondor (and which AccountingGroups they
+# can use) based on LDAP groups.
+
+# Borrowed significantly from Andy Loftus' sync_ldap_group_* .
+
+# The order of groups listed for each user in the map file
+# actually makes a difference - the first one listed will be used
+# by default. We don't have a good way to control this in
+# a meaningful manner, however, so we will just make sure
+# everything is sorted.
+
+
+# GLOBAL CONSTANTS AND VARIABLES
+
+DEBUG=0
+
+tmpdir=$( mktemp -d )
+
+ACCTMAP=/etc/condor/condor.acctmap
+ACCTMAP_NEW=$tmpdir/condor.acctmap.new
+
+ALLOWEDGROUPS_SRC=/etc/condor/condor.acctmap.groups.src
+ALLOWEDGROUPS=/etc/condor/condor.acctmap.groups
+ALLOWEDGROUPS_OLD=/etc/condor/condor.acctmap.groups.old
+DIFFALLOWEDGROUPS=$tmpdir/groups.diff
+
+ALLOWEDUSERS=/etc/condor/condor.acctmap.users
+ALLOWEDUSERS_TMP=$tmpdir/condor.acctmap.users.tmp
+ALLOWEDUSERS_OLD=/etc/condor/condor.acctmap.users.old
+DIFFALLOWEDUSERS=$tmpdir/users.diff
+
+DIFFACCTMAPS=$tmpdir/acctmap.diff
+
+
+# FUNCTIONS
+
+function logr() {
+    logger -t xcat -p local4.info "$*"
+    [[ $DEBUG -gt 0 ]] && echo "$*"
+}
+
+function cleanup() {
+    logr "$0: cleanup"
+    [[ $DEBUG -eq 1 ]] && return
+    rm -rf "$tmpdir"
+}
+
+function cleanexit() {
+    cleanup
+    logr "$0: complete"
+    exit 0
+}
+
+function die() {
+    logr "$0: $*" >&2
+    cleanup
+    exit 1
+}
+
+function is_ldap_online() {
+    logr "$0: testing connection to LDAP..."
+    local cmd=<%= $ldapsearch_cmd %>
+    local host='<%= $ldapsearch_host -%>'
+    local base='<%= $ldapsearch_dnbase -%>'
+    $cmd -x -s one -H $host -b $base \
+    | tail -n 20 \
+    | grep -qEzoi 'search result\Wsearch: [0-9]+\Wresult: [04]'
+}
+
+function get_ldap_userlist() {
+    local cmd=<%= $ldapsearch_cmd %>
+    local opts='<%= $ldapsearch_opts -%>'
+    local host='<%= $ldapsearch_host -%>'
+    local base='<%= $ldapsearch_dnbase -%>'
+    local query="<%= $ldapsearch_query -%>"
+    local field='<%= $ldapsearch_field -%>'
+    $cmd $opts -H $host -b $base $query $field \
+    | awk '
+        $1 ~ /^<%= $ldapsearch_field -%>:/ {
+            split( $2, fields, /,/ )
+            split( fields[1], parts, /=/ )
+            print parts[2]
+        }
+    ' \
+    | sort -u
+}
+
+function update_and_reconfigure() {
+    ## Replace file
+    logr "$0: installing new acct map file..."
+    mv $ACCTMAP_NEW $ACCTMAP || die "problem replacing acct map file"
+    ## Reconfigure condor schedd
+    logr "$0: reconfiguring HTCondor schedd..."
+    ## note: if schedd is not running, this will fail;
+    ##       that would be OK; when it starts, it will
+    ##       reload its config too
+    condor_reconfig -daemon schedd > /dev/null 2>&1
+    logr "$0: update_and_reconfigure finished"
+}
+
+
+# START WORK - PERFORM CHECKS
+
+[[ $DEBUG -eq 1 ]] && set -x
+
+logr "$0: execution beginning"
+
+# Stop if can't reach LDAP server
+is_ldap_online || die "LDAP server unreachable"
+
+
+# CHECK FOR CHANGES IN ALLOWED GROUPS
+
+cat $ALLOWEDGROUPS_SRC | sort > $ALLOWEDGROUPS
+if [ -f $ALLOWEDGROUPS_OLD ]; then
+    logr "$0: checking against old groups..."
+    diff $ALLOWEDGROUPS_OLD $ALLOWEDGROUPS > $DIFFALLOWEDGROUPS
+#    cat $DIFFALLOWEDGROUPS
+    if [ -f $DIFFALLOWEDGROUPS ] && [ -s $DIFFALLOWEDGROUPS ]; then
+        logr "$0: allowed groups have changed"
+        addgroups=`comm -23 <(cat "$ALLOWEDGROUPS") <(cat "$ALLOWEDGROUPS_OLD")`
+        rmvgroups=`comm -13 <(cat "$ALLOWEDGROUPS") <(cat "$ALLOWEDGROUPS_OLD")`
+    else
+        logr "$0: no changes in allowed groups"
+        addgroups=""
+        rmvgroups=""
+    fi
+else
+    logr "$0: no ALLOWEDGROUPS_OLD file"
+    logr "$0: considering all groups to be new on this submit node"
+    addgroups=`cat $ALLOWEDGROUPS`
+    rmvgroups=""
+fi
+
+
+# LIST GROUP CHANGES
+for i in `echo "$addgroups"`; do
+    logr "$0:   new allowed group: $i"
+done
+for i in `echo "$rmvgroups"`; do
+    logr "$0:   defunct allowed group: $i"
+done
+
+
+# ESTABLISH ALLOWEDUSERS LIST AND CHECK FOR CHANGES
+
+# Create new allowed users file and group membership files
+rm -f $ALLOWEDUSERS
+for i in `cat $ALLOWEDGROUPS`; do 
+    ldap_users=`get_ldap_userlist $i`
+    echo "$ldap_users" >> $ALLOWEDUSERS_TMP
+    echo "$ldap_users" > "${tmpdir}/userlist-${i}"
+done
+sort -u $ALLOWEDUSERS_TMP > $ALLOWEDUSERS
+
+if [ -f $ALLOWEDUSERS_OLD ]; then
+    logr "$0: checking against old users..."
+    diff $ALLOWEDUSERS_OLD $ALLOWEDUSERS > $DIFFALLOWEDUSERS
+#    cat $DIFFALLOWEDUSERS
+    if [ -f $DIFFALLOWEDUSERS ] && [ -s $DIFFALLOWEDUSERS ]; then
+        logr "$0: allowed users have changed"
+        addusers=`comm -23 <(cat "$ALLOWEDUSERS") <(cat "$ALLOWEDUSERS_OLD")`
+        rmvusers=`comm -13 <(cat "$ALLOWEDUSERS") <(cat "$ALLOWEDUSERS_OLD")`
+    else
+        logr "$0: no changes in allowed users"
+        addusers=""
+        rmvusers=""
+    fi
+else
+    logr "$0: no ALLOWEDUSERS_OLD file"
+    logr "$0: considering all users to be new on this submit node"
+    addusers=`cat $ALLOWEDUSERS`
+    rmvusers=""
+fi
+
+
+# LIST USER CHANGES
+for i in `echo "$addusers"`; do
+    logr "$0:   new allowed user: $i"
+done
+for i in `echo "$rmvusers"`; do
+    logr "$0:   defunct allowed users: $i"
+done
+
+
+# CREATE NEW ACCTMAP FILE
+
+logr "$0: creating new acctmap file..."
+for u in `cat $ALLOWEDUSERS`; do
+    [[ $DEBUG -eq 2 ]] && echo $u 
+    echo -n "* $u " >> $ACCTMAP_NEW
+    for g in `cat $ALLOWEDGROUPS`; do
+        grep -q "^$u\$" "${tmpdir}/userlist-${g}" && echo -n "$g," >> $ACCTMAP_NEW
+    done
+    echo "" >> $ACCTMAP_NEW
+done
+cat $ACCTMAP_NEW | sed 's/,$//g' > ${tmpdir}/foo
+mv ${tmpdir}/foo $ACCTMAP_NEW
+logr "$0: new acct map file complete"
+
+
+# COMPARE OLD AND NEW ACCTMAP FILE; REPLACE IF NEEDED
+
+logr "$0: comparing acct map files..."
+
+if [ -f $ACCTMAP ]; then
+    diff $ACCTMAP $ACCTMAP_NEW > $DIFFACCTMAPS
+    if [ -f $DIFFACCTMAPS ] && [ -s $DIFFACCTMAPS ]; then
+        logr "$0: acct map file has changed as follows:"
+        while read -r line; do
+            logr "$0: $line"
+        done < $DIFFACCTMAPS
+#        for k in `cat $DIFFACCTMAPS`; do
+#            logr "$0: $k"
+#        done
+        update_and_reconfigure
+    else
+        logr "$0: no changes in acct map file"
+    fi
+else
+    logr "$0: acct map does not exist yet"
+    logr "$0: acct map file will have contents:"
+    for k in `cat "$ACCTMAP_NEW"`; do
+        logr "$0: $k"
+    done
+    update_and_reconfigure
+fi
+
+
+# SAVE FILES FOR NEXT TIME
+
+cp -a $ALLOWEDGROUPS $ALLOWEDGROUPS_OLD
+cp -a $ALLOWEDUSERS $ALLOWEDUSERS_OLD
+
+
+## CLEAN UP
+
+cleanexit

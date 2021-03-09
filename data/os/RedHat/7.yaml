@@ -1,0 +1,5 @@
+---
+htcondor::config::config_group: "root"
+htcondor::config::config_owner: "root"
+htcondor::install::condor_package_name: "condor"
+htcondor::local_dir::fs_type: "xfs"
