@@ -1,5 +1,4 @@
 ---
-htcondor::submit::ldapsearch_cmd: /usr/bin/ldapsearch
+htcondor::submit::ldapsearch_cmd: "/usr/bin/ldapsearch"
 htcondor::submit::required_pkgs:
-    - openldap-clients
-
+  - "openldap-clients"

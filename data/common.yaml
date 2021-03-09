@@ -1,11 +1,9 @@
 ---
 lookup_options:
-    htcondor::submit::allowed_groups:
-        merge: unique
-
+  htcondor::submit::allowed_groups:
+    merge: "unique"
 htcondor::config::daemon_group: "condor"
 htcondor::config::daemon_user: "condor"
-
 htcondor::submit::ldapsearch_field: "uniqueMember"
 htcondor::submit::ldapsearch_opts: "-xLLL"
 htcondor::submit::ldapsearch_query: "(&(objectclass=groupOfUniqueNames)(cn=$1))"
